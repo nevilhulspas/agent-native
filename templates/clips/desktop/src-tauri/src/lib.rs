@@ -28,6 +28,7 @@ mod rewind_egress;
 mod rewind_local_ask;
 mod rewind_meeting_history;
 mod screen_memory;
+mod secure_input;
 mod screen_memory_ocr;
 mod screen_memory_transcript;
 mod sentry_report;
@@ -510,6 +511,8 @@ pub fn run() {
             meetings_watcher::spawn_watcher(app.handle().clone());
             adhoc_meetings_watcher::spawn_watcher(app.handle().clone());
             notifications::watch_meeting_notification_acks(app.handle());
+            #[cfg(target_os = "macos")]
+            secure_input::watch(app.handle());
             remote_flags::spawn_watcher(app.handle().clone());
             #[cfg(target_os = "macos")]
             parakeet_model::announce_slot_changes(app.handle());

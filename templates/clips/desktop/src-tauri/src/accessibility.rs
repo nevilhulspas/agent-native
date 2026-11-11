@@ -350,6 +350,11 @@ pub(crate) mod macos {
             attribute: CFStringRef,
             value: *mut CFTypeRef,
         ) -> AXError;
+        fn AXUIElementSetAttributeValue(
+            element: AXUIElementRef,
+            attribute: CFStringRef,
+            value: CFTypeRef,
+        ) -> AXError;
         static kAXTrustedCheckOptionPrompt: CFStringRef;
     }
 
@@ -505,6 +510,85 @@ pub(crate) mod macos {
         }
     }
 
+    /// kAXErrorNoValue: the element has no value for the attribute.
+    const AX_ERROR_NO_VALUE: AXError = -25212;
+    /// kAXErrorCannotComplete: the app did not answer.
+    const AX_ERROR_CANNOT_COMPLETE: AXError = -25204;
+
+    unsafe fn copy_focused_element(element: AXUIElementRef) -> Result<AXUIElementRef, AXError> {
+        let attribute = cfstr("AXFocusedUIElement");
+        if attribute.is_null() {
+            return Err(AX_ERROR_NO_VALUE);
+        }
+        let mut value = ptr::null();
+        let error = AXUIElementCopyAttributeValue(element, attribute, &mut value);
+        CFRelease(attribute as CFTypeRef);
+        if error != AX_ERROR_SUCCESS || value.is_null() {
+            return Err(if error == AX_ERROR_SUCCESS {
+                AX_ERROR_NO_VALUE
+            } else {
+                error
+            });
+        }
+        Ok(value as AXUIElementRef)
+    }
+
+    /// Sets `AXManualAccessibility` on the frontmost app (the switch Chromium
+    /// and Electron read to build their tree for assistive apps), then asks
+    /// that app for its focused element once. `None` when there is no
+    /// frontmost app to ask.
+    unsafe fn focused_element_after_enabling_frontmost(
+    ) -> Option<Result<AXUIElementRef, AXError>> {
+        let pid = frontmost_pid()?;
+        let application = AXUIElementCreateApplication(pid);
+        if application.is_null() {
+            return None;
+        }
+        let attribute = cfstr("AXManualAccessibility");
+        if !attribute.is_null() {
+            let error =
+                AXUIElementSetAttributeValue(application, attribute, kCFBooleanTrue as CFTypeRef);
+            CFRelease(attribute as CFTypeRef);
+            eprintln!(
+                "[accessibility] asked app {pid} to turn on its accessibility tree (AXError {error})"
+            );
+        }
+        // One immediate look, no waiting on the shortcut path. Chromium builds
+        // the tree asynchronously, so this first look can still come back
+        // empty; that counts as "could not answer" (the caller then pastes),
+        // and the next dictation finds the tree ready.
+        let lookup = copy_focused_element(application).map_err(|error| {
+            if error == AX_ERROR_NO_VALUE {
+                AX_ERROR_CANNOT_COMPLETE
+            } else {
+                error
+            }
+        });
+        CFRelease(application as CFTypeRef);
+        Some(lookup)
+    }
+
+    fn frontmost_pid() -> Option<i32> {
+        use objc2::msg_send;
+        use objc2::rc::autoreleasepool;
+        use objc2::runtime::{AnyClass, AnyObject};
+
+        autoreleasepool(|_| unsafe {
+            let class_name = std::ffi::CString::new("NSWorkspace").ok()?;
+            let cls: &AnyClass = AnyClass::get(&class_name)?;
+            let workspace: *mut AnyObject = msg_send![cls, sharedWorkspace];
+            if workspace.is_null() {
+                return None;
+            }
+            let app: *mut AnyObject = msg_send![workspace, frontmostApplication];
+            if app.is_null() {
+                return None;
+            }
+            let pid: i32 = msg_send![app, processIdentifier];
+            (pid > 0).then_some(pid)
+        })
+    }
+
     /// AX errors that mean "the app did not answer", not "nothing is focused".
     fn ax_error_is_unanswered(error: AXError) -> bool {
         // kAXErrorCannotComplete, kAXErrorFailure, kAXErrorNotImplemented.
@@ -521,24 +605,30 @@ pub(crate) mod macos {
             if system.is_null() {
                 return None;
             }
-            let attribute = cfstr("AXFocusedUIElement");
-            if attribute.is_null() {
-                CFRelease(system as CFTypeRef);
-                return None;
-            }
-            let mut value = ptr::null();
-            let error = AXUIElementCopyAttributeValue(system, attribute, &mut value);
-            CFRelease(attribute as CFTypeRef);
+            let mut lookup = copy_focused_element(system);
             CFRelease(system as CFTypeRef);
-            if error != AX_ERROR_SUCCESS || value.is_null() {
-                eprintln!("[accessibility] focused element lookup failed (AXError {error})");
-                return if ax_error_is_unanswered(error) {
-                    None
-                } else {
-                    Some(false)
-                };
+            if let Err(error) = lookup {
+                // Chromium and Electron apps (Claude, Slack, VS Code) keep their
+                // accessibility tree off until a client asks for it, so after
+                // they start the system reports no focused element. Ask the
+                // frontmost app to turn it on and look again.
+                if error == AX_ERROR_NO_VALUE || ax_error_is_unanswered(error) {
+                    if let Some(retry) = focused_element_after_enabling_frontmost() {
+                        lookup = retry;
+                    }
+                }
             }
-            let focused = value as AXUIElementRef;
+            let focused = match lookup {
+                Ok(element) => element,
+                Err(error) => {
+                    eprintln!("[accessibility] focused element lookup failed (AXError {error})");
+                    return if ax_error_is_unanswered(error) {
+                        None
+                    } else {
+                        Some(false)
+                    };
+                }
+            };
 
             let role = ax_string_attribute(focused, "AXRole");
             if role.is_none() {
